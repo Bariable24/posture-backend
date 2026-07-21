@@ -31,6 +31,7 @@ Run locally:
 
 import math
 import time
+from datetime import datetime, timezone
 from collections import deque
 from threading import Lock
 
@@ -73,6 +74,83 @@ command_queue = []
 
 # Tracks how long the current posture state has been sustained, for alerting.
 state_tracker = {"state": "unknown", "since": time.time()}
+
+# ---------------------------------------------------------------------------
+# Monthly report state
+# ---------------------------------------------------------------------------
+# We deliberately do NOT store raw readings for reporting — at ~1 reading/sec a
+# month would be ~2.6M rows. Instead each day rolls up into ONE small summary
+# dict (~10 numbers). A 31-day rolling window is ~310 stored numbers, comfortably
+# under the free tier's 500-value budget, and the monthly report endpoint just
+# aggregates those summaries on request instead of shipping raw history.
+DAILY_LOG_MAXLEN = 31
+daily_log = deque(maxlen=DAILY_LOG_MAXLEN)  # each: see _get_or_create_day()
+
+# Small rolled-up snapshot of the last fully-completed month, used only to show
+# a trend arrow — cheap (6 scalars) so it doesn't eat into the 500-value budget.
+prev_month_snapshot = {"month": None}
+
+# All-time best sustained "good" streak, and hour-of-day alert buckets for the
+# "posture tends to worsen after Xpm" insight (reset when the calendar month rolls over).
+longest_good_streak_seconds = 0.0
+hourly_alert_buckets = {"month": None, "counts": [0] * 24}
+_last_alert_flag = False
+
+
+def _today_str(ts=None):
+    return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _month_str(date_str):
+    return date_str[:7]  # "YYYY-MM-DD" -> "YYYY-MM"
+
+
+def _get_or_create_day(date_str, ts):
+    for d in daily_log:
+        if d["date"] == date_str:
+            return d
+    day = {
+        "date": date_str,
+        "samples": 0, "known_samples": 0,
+        "good": 0, "bad": 0,
+        "pitch_dev_sum": 0.0,
+        "alert_events": 0,
+        "calibrations": 0,
+        "first_ts": ts, "last_ts": ts,
+    }
+    daily_log.append(day)
+    return day
+
+
+def _snapshot_month_if_rolled_over(new_month):
+    """When the calendar month changes, roll whatever we still have for the
+    previous month into a tiny snapshot (for the trend arrow) before the daily
+    rolling window naturally evicts those days."""
+    global prev_month_snapshot, hourly_alert_buckets, longest_good_streak_seconds
+    if hourly_alert_buckets["month"] is not None and hourly_alert_buckets["month"] != new_month:
+        prev_days = [d for d in daily_log if _month_str(d["date"]) == hourly_alert_buckets["month"]]
+        if prev_days:
+            known = sum(d["known_samples"] for d in prev_days) or 1
+            prev_month_snapshot = {
+                "month": hourly_alert_buckets["month"],
+                "avg_health_score": round(_health_from_avg_dev(
+                    sum(d["pitch_dev_sum"] for d in prev_days) / known
+                ), 1),
+                "pct_good": round(100 * sum(d["good"] for d in prev_days) / known, 1),
+                "alert_count": sum(d["alert_events"] for d in prev_days),
+                "monitored_seconds": sum(d["last_ts"] - d["first_ts"] for d in prev_days),
+            }
+        hourly_alert_buckets = {"month": new_month, "counts": [0] * 24}
+    elif hourly_alert_buckets["month"] is None:
+        hourly_alert_buckets["month"] = new_month
+
+
+def _health_from_avg_dev(avg_abs_pitch_dev):
+    return clamp_val(100 - abs(avg_abs_pitch_dev) * 1.6, 0, 100)
+
+
+def clamp_val(v, lo, hi):
+    return max(lo, min(hi, v))
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +256,35 @@ def receive_sensor():
     }
 
     with lock:
-        global latest_reading
+        global latest_reading, longest_good_streak_seconds, _last_alert_flag
         latest_reading = reading
         history.append(reading)
+
+        now = reading["timestamp"]
+        date_str = _today_str(now)
+        _snapshot_month_if_rolled_over(_month_str(date_str))
+        day = _get_or_create_day(date_str, now)
+        day["samples"] += 1
+        day["last_ts"] = now
+
+        state = classification["state"]
+        if state not in ("unknown", "uncalibrated"):
+            day["known_samples"] += 1
+            day["pitch_dev_sum"] += abs(classification["pitch_dev"])
+            if state == "good":
+                day["good"] += 1
+                longest_good_streak_seconds = max(longest_good_streak_seconds, sustained_seconds)
+            else:
+                day["bad"] += 1
+
+        # Count alerts as discrete events (rising edge), not once per reading
+        # while the alert condition is held.
+        if alert and not _last_alert_flag:
+            day["alert_events"] += 1
+            hour = datetime.fromtimestamp(now, tz=timezone.utc).hour
+            if hourly_alert_buckets["month"] == _month_str(date_str):
+                hourly_alert_buckets["counts"][hour] += 1
+        _last_alert_flag = alert
 
     socketio.emit("posture_update", reading)
     return jsonify({"ok": True, "processed": reading})
@@ -216,6 +320,9 @@ def calibrate():
         baseline["pitch"] = latest_reading["pitch"]
         baseline["roll"] = latest_reading["roll"]
         baseline["calibrated"] = True
+        date_str = _today_str()
+        day = _get_or_create_day(date_str, time.time())
+        day["calibrations"] += 1
     return jsonify({"ok": True, "baseline": baseline})
 
 
@@ -233,6 +340,83 @@ def update_config():
             if key in data:
                 config[key] = float(data[key])
     return jsonify({"ok": True, "config": config})
+
+
+@app.route("/api/report/monthly", methods=["GET"])
+def get_monthly_report():
+    """
+    Everything a monthly report needs, computed from the rolling daily summaries
+    (see daily_log) rather than raw readings — keeps the payload small regardless
+    of how much sensor data actually streamed in during the month.
+    Query param: ?month=YYYY-MM (defaults to the current calendar month).
+    """
+    month = request.args.get("month") or _today_str()[:7]
+
+    with lock:
+        days = sorted([d for d in daily_log if _month_str(d["date"]) == month], key=lambda d: d["date"])
+
+        known_total = sum(d["known_samples"] for d in days)
+        good_total = sum(d["good"] for d in days)
+        bad_total = sum(d["bad"] for d in days)
+        alert_total = sum(d["alert_events"] for d in days)
+        calib_total = sum(d["calibrations"] for d in days)
+        monitored_seconds = sum(max(0, d["last_ts"] - d["first_ts"]) for d in days)
+
+        avg_pitch_dev = (sum(d["pitch_dev_sum"] for d in days) / known_total) if known_total else 0
+        avg_health = round(_health_from_avg_dev(avg_pitch_dev), 1) if known_total else None
+        pct_good = round(100 * good_total / known_total, 1) if known_total else None
+        pct_bad = round(100 - pct_good, 1) if pct_good is not None else None
+
+        daily_series = [{
+            "date": d["date"],
+            "avg_pitch_dev": round(d["pitch_dev_sum"] / d["known_samples"], 2) if d["known_samples"] else None,
+            "pct_good": round(100 * d["good"] / d["known_samples"], 1) if d["known_samples"] else None,
+            "samples": d["samples"],
+        } for d in days]
+
+        scored_days = [d for d in daily_series if d["avg_pitch_dev"] is not None]
+        best_day = min(scored_days, key=lambda d: d["avg_pitch_dev"]) if scored_days else None
+        worst_day = max(scored_days, key=lambda d: d["avg_pitch_dev"]) if scored_days else None
+
+        # Week 1-5 sub-breakdown within the month, by day-of-month // 7.
+        weekly_buckets = {}
+        for d in days:
+            week_idx = (int(d["date"][8:10]) - 1) // 7 + 1
+            wb = weekly_buckets.setdefault(week_idx, {"known": 0, "dev_sum": 0.0, "good": 0})
+            wb["known"] += d["known_samples"]
+            wb["dev_sum"] += d["pitch_dev_sum"]
+            wb["good"] += d["good"]
+        weekly_series = [{
+            "week": w,
+            "avg_health_score": round(_health_from_avg_dev(wb["dev_sum"] / wb["known"]), 1) if wb["known"] else None,
+            "pct_good": round(100 * wb["good"] / wb["known"], 1) if wb["known"] else None,
+        } for w, wb in sorted(weekly_buckets.items())]
+
+        prev = prev_month_snapshot if prev_month_snapshot.get("month") else None
+        health_trend_pct = None
+        if prev and avg_health is not None and prev["avg_health_score"]:
+            health_trend_pct = round(avg_health - prev["avg_health_score"], 1)
+
+        hourly = list(hourly_alert_buckets["counts"]) if hourly_alert_buckets["month"] == month else [0] * 24
+
+        return jsonify({
+            "month": month,
+            "days_logged": len(days),
+            "total_monitored_seconds": round(monitored_seconds),
+            "avg_health_score": avg_health,
+            "prev_month_avg_health_score": prev["avg_health_score"] if prev else None,
+            "health_trend_pct": health_trend_pct,
+            "pct_good": pct_good,
+            "pct_bad": pct_bad,
+            "alert_count": alert_total,
+            "longest_good_streak_seconds": round(longest_good_streak_seconds),
+            "calibration_count": calib_total,
+            "daily": daily_series,
+            "weekly": weekly_series,
+            "best_day": best_day,
+            "worst_day": worst_day,
+            "hourly_alerts": hourly,
+        })
 
 
 @app.route("/api/commands", methods=["GET"])
