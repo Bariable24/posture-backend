@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: posture-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # eventlet worker is required for Flask-SocketIO's websocket support in production
+    startCommand: gunicorn --worker-class eventlet -w 1 app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
